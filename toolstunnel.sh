@@ -67,13 +67,13 @@ ask_valid() { # ask_valid VAR "Prompt" "default" validator
 
 choose() { # choose VAR "Title" "option text" ...   -> VAR = chosen option text
   local __v="$1" __t="$2"; shift 2
-  local opts=("$@") n=${#opts[@]} i pick=""
+  local __opts=("$@") __n=$# __i __pick=""
   echo; echo "$__t"
-  for ((i = 0; i < n; i++)); do printf '  %d) %s\n' $((i + 1)) "${opts[i]}"; done
+  for ((__i = 0; __i < __n; __i++)); do printf '  %d) %s\n' $((__i + 1)) "${__opts[__i]}"; done
   while true; do
-    IFS= read -r -p "Choose [1-$n]: " pick || die "Input closed."
-    if [[ "$pick" =~ ^[0-9]+$ ]] && ((10#$pick >= 1 && 10#$pick <= n)); then
-      printf -v "$__v" '%s' "${opts[10#$pick - 1]}"
+    IFS= read -r -p "Choose [1-$__n]: " __pick || die "Input closed."
+    if [[ "$__pick" =~ ^[0-9]+$ ]] && ((10#$__pick >= 1 && 10#$__pick <= __n)); then
+      printf -v "$__v" '%s' "${__opts[10#$__pick - 1]}"
       return 0
     fi
     warn "Invalid choice."
@@ -456,7 +456,7 @@ EOF
   fi
 
   save_meta "$name" KIND=tun ROLE="$role" MODE="$mode" PORT="$rawport" HOST="${host:-}" TOKEN="$token" PEER="$peer" IFACE="$iface"
-  write_unit "$name" "TUN tunnel $name (tun-$mode, $role)" <<EOF
+  write_unit "$name" "TUN tunnel $name (tun-${mode/faketcp/tcp}, $role)" <<EOF
 Type=simple
 $pre
 ExecStartPre=-$wgq down $iface
@@ -509,7 +509,7 @@ create_tun() {
   ok "Tunnel '$name' created. Service: $(systemctl is-active "$APP-$name.service")"
   echo
   echo "On the OTHER server create a '$([[ $role == server ]] && echo client || echo server)' TUN tunnel with:"
-  echo "  type    : tun-$mode"
+  echo "  type    : tun-${mode/faketcp/tcp}"
   echo "  port    : $rawport"
   echo "  token   : $token"
   echo "  network : $prefix"
