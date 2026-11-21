@@ -20,8 +20,8 @@ TDIR="$CONF/tunnels"
 UNIT_DIR="${TT_UNIT_DIR:-/etc/systemd/system}"
 WG_DIR="${TT_WG_DIR:-/etc/wireguard}"
 
-# >>> Change YOUR_GITHUB_USER to your GitHub username <<<
-REPO_RAW="https://raw.githubusercontent.com/YOUR_GITHUB_USER/Toolstunnel/main"
+# >>> Change Toolstunnel to your GitHub username <<<
+REPO_RAW="https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main"
 
 BACKHAUL_URL="https://github.com/Musixal/Backhaul/releases/latest/download"
 UDP2RAW_URL="https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz"

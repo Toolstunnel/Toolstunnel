@@ -11,7 +11,7 @@
 Toolstunnel is a Bash script. It installs and manages open-source tunnel programs for you and creates a `systemd` service for every tunnel (auto-start, auto-restart).
 
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/Toolstunnel/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main/install.sh)
 ```
 
 Run it as **root** on **both** servers. Next time just run `toolstunnel`.
@@ -60,7 +60,7 @@ Toolstunnel یک اسکریپت Bash است که برنامه‌های متن‌
 ## نصب
 
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/Toolstunnel/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main/install.sh)
 ```
 
 روی **هر دو** سرور و با کاربر **root** اجرا کن. دفعهٔ بعد فقط بنویس: `toolstunnel`

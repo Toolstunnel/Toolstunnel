@@ -2,8 +2,8 @@
 # Toolstunnel installer - run as root.
 set -eu
 
-# >>> Change YOUR_GITHUB_USER to your GitHub username <<<
-REPO_RAW="https://raw.githubusercontent.com/YOUR_GITHUB_USER/Toolstunnel/main"
+# >>> Change Toolstunnel to your GitHub username <<<
+REPO_RAW="https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main"
 
 [[ $EUID -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl is required. Install it first: apt-get install -y curl"; exit 1; }
