@@ -3,16 +3,17 @@
 #  Toolstunnel - interactive manager for reverse tunnels
 #
 #   1) Stream tunnels : Backhaul  (tcp, tcpmux, ws, wss, wsmux, wssmux)
+#                       frp       (kcp, quic)
 #   2) TUN tunnels    : WireGuard + udp2raw  (tun-tcp, tun-udp, tun-icmp)
-#   3) Kernel tunnels : GRE / IPIP / SIT
+#   3) Kernel tunnels : GRE / GRETAP / IPIP / SIT / L2TPv3
 #
-#  Third-party programs (Backhaul, udp2raw, WireGuard) are downloaded or
+#  Third-party programs (Backhaul, frp, udp2raw, WireGuard) are downloaded or
 #  installed from their official sources. They are NOT bundled here.
 # =====================================================================
 set -u
 
 APP="toolstunnel"
-VERSION="0.1.0"
+VERSION="0.3.0"
 BASE="${TT_BASE:-/opt/toolstunnel}"
 BIN="$BASE/bin"
 CONF="${TT_CONF:-/etc/toolstunnel}"
@@ -20,7 +21,6 @@ TDIR="$CONF/tunnels"
 UNIT_DIR="${TT_UNIT_DIR:-/etc/systemd/system}"
 WG_DIR="${TT_WG_DIR:-/etc/wireguard}"
 
-# >>> Change Toolstunnel to your GitHub username <<<
 REPO_RAW="https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main"
 
 BACKHAUL_URL="https://github.com/Musixal/Backhaul/releases/latest/download"
@@ -65,6 +65,12 @@ ask_valid() { # ask_valid VAR "Prompt" "default" validator
   done
 }
 
+ask_yes() { # ask_yes "Question" -> 0 if yes (default no)
+  local __a=""
+  ask __a "$1 [y/N]" ""
+  [[ "$__a" =~ ^[Yy] ]]
+}
+
 choose() { # choose VAR "Title" "option text" ...   -> VAR = chosen option text
   local __v="$1" __t="$2"; shift 2
   local __opts=("$@") __n=$# __i __pick=""
@@ -96,6 +102,13 @@ valid_ipv4() {
 valid_host()   { [[ "${1:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
 valid_name()   { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,11}$ ]]; }
 valid_token()  { [[ "${1:-}" =~ ^[A-Za-z0-9._~-]{16,}$ ]]; }
+valid_mtu()    { [[ "${1:-}" =~ ^[0-9]{3,4}$ ]] && ((10#$1 >= 576 && 10#$1 <= 9000)); }
+valid_ttl()    { [[ "${1:-}" =~ ^[0-9]{1,3}$ ]] && ((10#$1 >= 1 && 10#$1 <= 255)); }
+valid_links()  { [[ "${1:-}" =~ ^[0-9]{1,2}$ ]] && ((10#$1 >= 1 && 10#$1 <= 64)); }
+valid_idx()    { [[ "${1:-}" =~ ^[0-9]{1,3}$ ]] && ((10#$1 >= 1 && 10#$1 <= 250)); }
+valid_id()     { [[ "${1:-}" =~ ^[0-9]{1,9}$ ]] && ((10#$1 >= 1 && 10#$1 <= 999999999)); }
+valid_key()    { [[ -z "${1:-}" ]] || { [[ "$1" =~ ^[0-9]{1,10}$ ]] && ((10#$1 <= 4294967295)); }; }
+
 valid_prefix() { # a.b.c  (first three octets)
   local p="${1:-}" o
   [[ "$p" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){2}$ ]] || return 1
@@ -103,8 +116,25 @@ valid_prefix() { # a.b.c  (first three octets)
   for o in $p; do ((10#$o <= 255)) || return 1; done
   return 0
 }
-valid_bh_ports()  { [[ "${1:-}" =~ ^[0-9]+(-[0-9]+)?(=[0-9]+)?(,[0-9]+(-[0-9]+)?(=[0-9]+)?)*$ ]]; }
-valid_fwd_ports() { [[ -z "${1:-}" || "$1" =~ ^[0-9]+(=[0-9]+)?(,[0-9]+(=[0-9]+)?)*$ ]]; }
+
+valid_bh_ports() { [[ "${1:-}" =~ ^[0-9]+(-[0-9]+)?(=[0-9]+)?(,[0-9]+(-[0-9]+)?(=[0-9]+)?)*$ ]]; }
+
+# Forward list: 2052 | 2052/udp | 2052/both | 8443=443 | 8443=443/udp  (comma separated, empty = none)
+valid_fwd_ports() {
+  local s="${1:-}" spec base p
+  local -a specs=() nums=()
+  [[ -z "$s" ]] && return 0
+  [[ "$s" =~ ^[0-9]+(=[0-9]+)?(/(tcp|udp|both))?(,[0-9]+(=[0-9]+)?(/(tcp|udp|both))?)*$ ]] || return 1
+  IFS=',' read -ra specs <<<"$s"
+  for spec in "${specs[@]}"; do
+    base="${spec%%/*}"
+    IFS='=' read -ra nums <<<"$base"
+    for p in "${nums[@]}"; do valid_port "$p" || return 1; done
+  done
+  return 0
+}
+valid_fwd_nonempty() { [[ -n "${1:-}" ]] && valid_fwd_ports "$1"; }
+valid_fwd_or_clear() { [[ "${1:-}" == "-" ]] || valid_fwd_ports "${1:-}"; }
 
 gen_token() { tr -dc 'a-f0-9' </dev/urandom | head -c 32; }
 
@@ -147,12 +177,12 @@ pkg_install() { # pkg_install <apt names> -- <rpm names>
 
 ensure_base() {
   local c missing=0
-  for c in curl tar openssl iptables ip systemctl; do
+  for c in curl tar openssl iptables ip systemctl ping; do
     command -v "$c" >/dev/null 2>&1 || missing=1
   done
   if ((missing)); then
     info "Installing required packages..."
-    pkg_install curl tar openssl iptables iproute2 -- curl tar openssl iptables iproute || true
+    pkg_install curl tar openssl iptables iproute2 iputils-ping -- curl tar openssl iptables iproute iputils || true
   fi
   for c in curl tar openssl iptables ip systemctl; do
     command -v "$c" >/dev/null 2>&1 || { err "Missing command: $c"; return 1; }
@@ -185,6 +215,35 @@ install_backhaul() {
   install -m 0755 "$f" "$BIN/backhaul"
   rm -rf "$tmp"
   ok "Backhaul installed."
+}
+
+install_frp() {
+  [[ -x "$BIN/frps" && -x "$BIN/frpc" ]] && return 0
+  detect_arch || return 1
+  local tmp ver url f src
+  tmp="$(mktemp -d)"
+  info "Finding the latest frp release..."
+  ver="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/fatedier/frp/releases/latest 2>/dev/null \
+    | sed -n 's#.*/tag/v\([0-9][0-9.]*\)$#\1#p')"
+  if [[ -z "$ver" ]]; then
+    rm -rf "$tmp"
+    err "Could not find the latest frp version. Check that this server can reach github.com,"
+    err "or place the 'frps' and 'frpc' binaries manually in $BIN and retry."
+    return 1
+  fi
+  url="https://github.com/fatedier/frp/releases/download/v${ver}/frp_${ver}_linux_${ARCH}.tar.gz"
+  info "Downloading frp $ver ($ARCH)..."
+  if ! curl -fsSL --retry 3 -o "$tmp/frp.tgz" "$url"; then
+    rm -rf "$tmp"; err "Download failed: $url"; return 1
+  fi
+  tar -xzf "$tmp/frp.tgz" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; err "Could not extract frp."; return 1; }
+  for f in frps frpc; do
+    src="$(find "$tmp" -type f -name "$f" | head -n1)"
+    [[ -n "$src" ]] || { rm -rf "$tmp"; err "$f not found in the archive."; return 1; }
+    install -m 0755 "$src" "$BIN/$f"
+  done
+  rm -rf "$tmp"
+  ok "frp $ver installed."
 }
 
 install_udp2raw() {
@@ -222,10 +281,22 @@ save_meta() { # save_meta name KEY=VAL ...
   chmod 600 "$TDIR/$name.meta"
 }
 
+meta_set() { # meta_set name KEY VALUE  (update or add one field)
+  local f="$TDIR/$1.meta"
+  [[ -f "$f" ]] || return 1
+  { grep -v "^$2=" "$f" || true; printf '%s=%q\n' "$2" "$3"; } >"$f.tmp"
+  mv "$f.tmp" "$f"
+  chmod 600 "$f"
+}
+
 load_meta() { # load_meta name
-  unset KIND ROLE MODE PORT HOST TOKEN PEER LOCALIP IFACE
+  unset KIND ROLE MODE PORT HOST TOKEN PEER LOCALIP IFACE MTU TTL FWD TARGET PORTS LINKS
   # shellcheck disable=SC1090
   source "$TDIR/$1.meta"
+}
+
+type_label() { # uses KIND MODE
+  if [[ "${KIND:-}" == tun ]]; then echo "tun-${MODE/faketcp/tcp}"; else echo "${MODE:-?}"; fi
 }
 
 tunnel_exists() { [[ -f "$TDIR/$1.meta" ]]; }
@@ -257,24 +328,34 @@ EOF
   systemctl restart "$APP-$name.service" >/dev/null 2>&1
 }
 
-gen_fw_script() { # gen_fw_script name peer_ip "ports csv"
-  local name="$1" peer="$2" ports="$3" f="$TDIR/$1.fw" spec src dst proto
+# Port forwarding through a tunnel (server side). Specs: 2052 | 2052/udp | 2052/both | 8443=443[/proto]
+gen_fw_script() { # gen_fw_script name target_ip "ports csv"
+  local name="$1" target="$2" ports="$3" f="$TDIR/$1.fw"
+  local -a specs=()
+  local spec base suffix src dst protos proto
+  IFS=',' read -ra specs <<<"$ports"
   {
     echo '#!/usr/bin/env bash'
     echo '# usage: fw script up|down'
     echo 'if [[ "${1:-}" == up ]]; then OP=-A; else OP=-D; fi'
     echo 'ipt_fwd() { if [[ "$OP" == -A ]]; then iptables -I FORWARD 1 "$@"; else iptables -D FORWARD "$@"; fi; }'
     echo '[[ "$OP" == -A ]] && sysctl -w net.ipv4.ip_forward=1 >/dev/null'
-    local IFS=','
-    for spec in $ports; do
-      src="${spec%%=*}"; dst="${spec##*=}"
-      for proto in tcp udp; do
-        echo "iptables -t nat \$OP PREROUTING -p $proto --dport $src -j DNAT --to-destination $peer:$dst || true"
+    for spec in "${specs[@]}"; do
+      base="${spec%%/*}"; suffix=""
+      [[ "$spec" == */* ]] && suffix="${spec#*/}"
+      src="${base%%=*}"; dst="${base##*=}"
+      case "$suffix" in
+        udp)  protos="udp" ;;
+        both) protos="tcp udp" ;;
+        *)    protos="tcp" ;;
+      esac
+      for proto in $protos; do
+        echo "iptables -t nat \$OP PREROUTING -p $proto --dport $src -j DNAT --to-destination $target:$dst || true"
       done
     done
-    echo "iptables -t nat \$OP POSTROUTING -d $peer -j MASQUERADE || true"
-    echo "ipt_fwd -d $peer -j ACCEPT || true"
-    echo "ipt_fwd -s $peer -j ACCEPT || true"
+    echo "iptables -t nat \$OP POSTROUTING -d $target -j MASQUERADE || true"
+    echo "ipt_fwd -d $target -j ACCEPT || true"
+    echo "ipt_fwd -s $target -j ACCEPT || true"
     echo "exit 0"
   } >"$f"
   chmod 700 "$f"
@@ -296,7 +377,7 @@ gen_cert() { # gen_cert name
   fi
 }
 
-# uses: name role transport port host token ports
+# uses: name role transport port host token ports links
 gen_backhaul_conf() {
   local f="$TDIR/$name.toml" mux=0 tls=0
   [[ "$transport" == *mux ]] && mux=1
@@ -320,13 +401,13 @@ gen_backhaul_conf() {
       echo "channel_size = 2048"
       echo "ports = $(ports_toml "$ports")"
     else
-      echo "connection_pool = 8"
+      echo "connection_pool = ${links:-8}"
       echo "aggressive_pool = false"
       echo "retry_interval = 3"
       echo "dial_timeout = 10"
     fi
     if ((mux)); then
-      echo "mux_con = 8"
+      echo "mux_con = ${links:-8}"
       echo "mux_version = 1"
       echo "mux_framesize = 32768"
       echo "mux_recievebuffer = 4194304"
@@ -345,7 +426,7 @@ build_backhaul() {
     gen_cert "$name" || { err "Could not create a TLS certificate."; return 1; }
   fi
   gen_backhaul_conf
-  save_meta "$name" KIND=stream ROLE="$role" MODE="$transport" PORT="$port" HOST="${host:-}" TOKEN="$token"
+  save_meta "$name" KIND=stream ROLE="$role" MODE="$transport" PORT="$port" HOST="${host:-}" TOKEN="$token" PORTS="${ports:-}" LINKS="${links:-8}"
   write_unit "$name" "stream tunnel $name ($transport, $role)" <<EOF
 Type=simple
 ExecStart=$BIN/backhaul -c $TDIR/$name.toml
@@ -355,10 +436,97 @@ LimitNOFILE=1048576
 EOF
 }
 
+# uses: name role transport port host token ports target
+gen_frp_conf() {
+  local f="$TDIR/$name.toml"
+  local -a specs=()
+  local spec base suffix src dst protos proto
+  {
+    if [[ "$role" == server ]]; then
+      echo 'bindAddr = "0.0.0.0"'
+      echo "bindPort = $port"
+      if [[ "$transport" == kcp ]]; then echo "kcpBindPort = $port"; else echo "quicBindPort = $port"; fi
+      echo "auth.token = \"$token\""
+      echo 'log.level = "info"'
+    else
+      echo "serverAddr = \"$host\""
+      echo "serverPort = $port"
+      echo "auth.token = \"$token\""
+      echo "transport.protocol = \"$transport\""
+      echo 'loginFailExit = false'
+      echo 'log.level = "info"'
+      IFS=',' read -ra specs <<<"$ports"
+      for spec in "${specs[@]}"; do
+        base="${spec%%/*}"; suffix=""
+        [[ "$spec" == */* ]] && suffix="${spec#*/}"
+        src="${base%%=*}"; dst="${base##*=}"
+        case "$suffix" in
+          udp)  protos="udp" ;;
+          both) protos="tcp udp" ;;
+          *)    protos="tcp" ;;
+        esac
+        for proto in $protos; do
+          echo
+          echo '[[proxies]]'
+          echo "name = \"$name-$src-$proto\""
+          echo "type = \"$proto\""
+          echo "localIP = \"${target:-127.0.0.1}\""
+          echo "localPort = $dst"
+          echo "remotePort = $src"
+        done
+      done
+    fi
+  } >"$f"
+  chmod 600 "$f"
+}
+
+build_frp() {
+  local exe="frpc"
+  [[ "$role" == server ]] && exe="frps"
+  gen_frp_conf
+  save_meta "$name" KIND=frp ROLE="$role" MODE="$transport" PORT="$port" HOST="${host:-}" TOKEN="$token" \
+    PORTS="${ports:-}" TARGET="${target:-}"
+  write_unit "$name" "$transport tunnel $name ($role)" <<EOF
+Type=simple
+ExecStart=$BIN/$exe -c $TDIR/$name.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+EOF
+}
+
+create_frp_tunnel() { # called by create_stream for kcp / quic
+  install_frp || return 1
+  if [[ "$role" == server ]]; then
+    ask_valid port "UDP port to listen on" "3080" valid_port
+    ask_valid token "Token (Enter = auto-generate)" "$(gen_token)" valid_token
+  else
+    ask_valid host "IP or domain of the SERVER side" "" valid_host
+    ask_valid port "UDP port of the server" "3080" valid_port
+    ask_valid token "Token (must match the server)" "" valid_token
+    ask_valid ports "Ports to open on the SERVER (e.g. 2052,8443=443,53/udp)" "" valid_fwd_nonempty
+    ask_valid target "Where is the service on THIS server" "127.0.0.1" valid_host
+  fi
+  build_frp || return 1
+  sleep 2
+  ok "Tunnel '$name' created. Service: $(systemctl is-active "$APP-$name.service")"
+  echo
+  if [[ "$role" == server ]]; then
+    echo "On the OTHER server create a 'client' tunnel with:"
+    echo "  transport : $transport"
+    echo "  port      : $port"
+    echo "  token     : $token"
+    echo "  (it will also ask which ports to open here; open UDP port $port in the firewall)"
+  else
+    echo "Ports $ports are opened on the server and land on $target here."
+    echo "Make sure the server side tunnel (same transport, port and token) is running."
+  fi
+  return 0
+}
+
 create_stream() {
   ensure_base || return 1
-  install_backhaul || return 1
-  local pick role name transport port host="" token ports=""
+  local pick role name transport port host="" token ports="" target="" links=8
   choose pick "Which side is this server?" \
     "server - listens for the tunnel (usually the Iran side)" \
     "client - dials in to the server (usually the foreign side)"
@@ -370,8 +538,15 @@ create_stream() {
     "ws      - WebSocket" \
     "wss     - WebSocket + TLS" \
     "wsmux   - multiplexed WebSocket" \
-    "wssmux  - multiplexed WebSocket + TLS"
+    "wssmux  - multiplexed WebSocket + TLS" \
+    "kcp     - KCP over UDP (low latency, handles loss)" \
+    "quic    - QUIC over UDP (needs a clean, low-loss path)"
   transport="${pick%% *}"
+  if [[ "$transport" == kcp || "$transport" == quic ]]; then
+    create_frp_tunnel
+    return $?
+  fi
+  install_backhaul || return 1
   if [[ "$role" == server ]]; then
     ask_valid port "Tunnel port to listen on" "3080" valid_port
     ask_valid ports "Ports to open for users (e.g. 2052,8443=443,1000-2000)" "" valid_bh_ports
@@ -380,6 +555,9 @@ create_stream() {
     ask_valid host "IP or domain of the SERVER side" "" valid_host
     ask_valid port "Tunnel port of the server" "3080" valid_port
     ask_valid token "Token (must match the server)" "" valid_token
+  fi
+  if ask_yes "Advanced options (parallel links)?"; then
+    ask_valid links "Parallel links (more links = more resilient to throttling)" "$links" valid_links
   fi
   build_backhaul || return 1
   sleep 2
@@ -396,7 +574,7 @@ create_stream() {
 # ---------------------------------------------------------------------
 #  2) TUN tunnels (WireGuard + udp2raw)  ->  tun-tcp / tun-udp / tun-icmp
 # ---------------------------------------------------------------------
-# uses: name role mode rawport host token prefix wgport lport fwd
+# uses: name role mode rawport host token prefix wgport lport mtu fwd target
 build_wg() {
   local iface="tt-$name" sp cp psk spub cpub mine peer rawkey
   sp="$(tt_key "srv:$token")"; cp="$(tt_key "cli:$token")"; psk="$(tt_key "psk:$token")"
@@ -404,6 +582,7 @@ build_wg() {
   spub="$(printf '%s' "$sp" | wg pubkey)"; cpub="$(printf '%s' "$cp" | wg pubkey)"
   [[ -n "$spub" && -n "$cpub" ]] || { err "Key derivation failed."; return 1; }
   if [[ "$role" == server ]]; then mine="$prefix.1"; peer="$prefix.2"; else mine="$prefix.2"; peer="$prefix.1"; fi
+  [[ -z "${target:-}" ]] && target="$peer"
 
   mkdir -p "$WG_DIR"
   (
@@ -414,7 +593,7 @@ build_wg() {
 Address = $mine/30
 ListenPort = $wgport
 PrivateKey = $sp
-MTU = 1200
+MTU = $mtu
 
 [Peer]
 PublicKey = $cpub
@@ -426,7 +605,7 @@ EOF
 [Interface]
 Address = $mine/30
 PrivateKey = $cp
-MTU = 1200
+MTU = $mtu
 
 [Peer]
 PublicKey = $spub
@@ -449,13 +628,14 @@ EOF
     pre="ExecStartPre=$sc -w net.ipv4.icmp_echo_ignore_all=1"
     post="ExecStopPost=-$sc -w net.ipv4.icmp_echo_ignore_all=0"
   fi
-  if [[ "$role" == server && -n "$fwd" ]]; then
-    gen_fw_script "$name" "$peer" "$fwd"
-    fw_start="ExecStartPost=-/bin/bash $TDIR/$name.fw up"
-    fw_stop="ExecStopPost=-/bin/bash $TDIR/$name.fw down"
+  if [[ "$role" == server ]]; then
+    if [[ -n "${fwd:-}" ]]; then gen_fw_script "$name" "$target" "$fwd"; else rm -f "$TDIR/$name.fw"; fi
+    fw_start="ExecStartPost=-/bin/sh -c '[ -f $TDIR/$name.fw ] && /bin/bash $TDIR/$name.fw up'"
+    fw_stop="ExecStopPost=-/bin/sh -c '[ -f $TDIR/$name.fw ] && /bin/bash $TDIR/$name.fw down'"
   fi
 
-  save_meta "$name" KIND=tun ROLE="$role" MODE="$mode" PORT="$rawport" HOST="${host:-}" TOKEN="$token" PEER="$peer" IFACE="$iface"
+  save_meta "$name" KIND=tun ROLE="$role" MODE="$mode" PORT="$rawport" HOST="${host:-}" TOKEN="$token" \
+    PEER="$peer" IFACE="$iface" MTU="$mtu" FWD="${fwd:-}" TARGET="$target"
   write_unit "$name" "TUN tunnel $name (tun-${mode/faketcp/tcp}, $role)" <<EOF
 Type=simple
 $pre
@@ -476,7 +656,7 @@ create_tun() {
   ensure_base || return 1
   ensure_wireguard || return 1
   install_udp2raw || return 1
-  local pick role name mode rawport host="" token prefix wgport lport fwd=""
+  local pick role name mode rawport host="" token prefix wgport lport fwd="" target="" mtu=1200
   choose pick "Which side is this server?" \
     "server - listens for the tunnel (usually the Iran side)" \
     "client - dials in to the server (usually the foreign side)"
@@ -500,9 +680,15 @@ create_tun() {
     ask_valid token "Token (must match the server)" "" valid_token
   fi
   ask_valid prefix "Private tunnel network (first 3 octets; server=.1 client=.2)" "10.88.0" valid_prefix
+  if ask_yes "Advanced options (MTU)?"; then
+    ask_valid mtu "MTU" "$mtu" valid_mtu
+  fi
   wgport=$((20000 + RANDOM % 20000)); lport=$((40000 + RANDOM % 20000))
   if [[ "$role" == server ]]; then
-    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443; Enter = none)" "" valid_fwd_ports
+    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443,53/udp; Enter = none)" "" valid_fwd_ports
+    if [[ -n "$fwd" ]]; then
+      ask_valid target "Deliver them to (address on the other side)" "$prefix.2" valid_ipv4
+    fi
   fi
   build_wg || return 1
   sleep 3
@@ -514,26 +700,41 @@ create_tun() {
   echo "  token   : $token"
   echo "  network : $prefix"
   [[ "$role" == server ]] && echo "  (the client needs this server's public IP; open port $rawport in the firewall)"
-  echo "Then test from the 'Manage tunnels' menu (Test)."
+  if [[ -n "$fwd" ]]; then
+    echo
+    echo "Forwarding $fwd -> ${target:-$prefix.2}: the service on the other side must listen on that address (or 0.0.0.0)."
+  fi
+  echo "Then run 'Manage tunnels -> Health check' to test the link."
   [[ "$mode" == icmp ]] && warn "ICMP mode makes this server ignore normal pings while the tunnel runs."
   return 0
 }
 
 # ---------------------------------------------------------------------
-#  3) Kernel tunnels (GRE / IPIP / SIT)
+#  3) Kernel tunnels (GRE / GRETAP / IPIP / SIT / L2TPv3)
 # ---------------------------------------------------------------------
 default_local_ip() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
 
-# uses: name role mode localip remote prefix idx fwd
+# uses: name role mode localip remote prefix idx mtu ttl gkey l2enc l2port l2id fwd target
 build_kernel() {
-  local iface="tt-$name" mod addr peer f="$TDIR/$name.sh"
-  case "$mode" in gre) mod=ip_gre ;; ipip) mod=ipip ;; sit) mod=sit ;; esac
+  local iface="tt-$name" addr peer f="$TDIR/$name.sh" keyopt="" T PT S PS
   if [[ "$mode" == sit ]]; then
-    if [[ "$role" == server ]]; then addr="fd88:$idx::1/64"; peer="fd88:$idx::2"; else addr="fd88:$idx::2/64"; peer="fd88:$idx::1"; fi
+    if [[ "$role" == server ]]; then
+      addr="fd88:$idx::1/64"; peer="fd88:$idx::2"
+    else
+      addr="fd88:$idx::2/64"; peer="fd88:$idx::1"
+    fi
   else
     if [[ "$role" == server ]]; then addr="$prefix.1/30"; peer="$prefix.2"; else addr="$prefix.2/30"; peer="$prefix.1"; fi
   fi
-  if [[ "$role" == server && "$mode" != sit && -n "$fwd" ]]; then gen_fw_script "$name" "$peer" "$fwd"; fi
+  [[ -n "${gkey:-}" ]] && keyopt=" key $gkey"
+  [[ -z "${target:-}" ]] && target="$peer"
+  if [[ "$role" == server && "$mode" != sit && -n "${fwd:-}" ]]; then
+    gen_fw_script "$name" "$target" "$fwd"
+  else
+    rm -f "$TDIR/$name.fw"
+  fi
+  if [[ "$role" == server ]]; then T=$l2id; PT=$((l2id + 1)); else T=$((l2id + 1)); PT=$l2id; fi
+  S=$T; PS=$PT
 
   {
     echo '#!/usr/bin/env bash'
@@ -541,20 +742,41 @@ build_kernel() {
     echo "FW=\"$TDIR/$name.fw\""
     echo 'down() {'
     echo '  [[ -f "$FW" ]] && bash "$FW" down >/dev/null 2>&1'
-    echo '  ip link set dev "$IFACE" down >/dev/null 2>&1'
-    echo '  ip tunnel del "$IFACE" >/dev/null 2>&1'
+    if [[ "$mode" == l2tp ]]; then
+      echo "  ip l2tp del session tunnel_id $T session_id $S >/dev/null 2>&1"
+      echo "  ip l2tp del tunnel tunnel_id $T >/dev/null 2>&1"
+    else
+      echo '  ip link del "$IFACE" >/dev/null 2>&1'
+    fi
     echo '  return 0'
     echo '}'
     echo 'up() {'
     echo '  down'
-    echo "  modprobe $mod 2>/dev/null"
-    echo "  ip tunnel add \"\$IFACE\" mode $mode local $localip remote $remote ttl 255 || exit 1"
+    case "$mode" in
+      gre | gretap) echo '  modprobe ip_gre 2>/dev/null' ;;
+      ipip)         echo '  modprobe ipip 2>/dev/null' ;;
+      sit)          echo '  modprobe sit 2>/dev/null' ;;
+      l2tp)
+        echo '  modprobe l2tp_eth 2>/dev/null; modprobe l2tp_netlink 2>/dev/null'
+        [[ "$l2enc" == ip ]] && echo '  modprobe l2tp_ip 2>/dev/null'
+        ;;
+    esac
+    if [[ "$mode" == l2tp ]]; then
+      if [[ "$l2enc" == udp ]]; then
+        echo "  ip l2tp add tunnel tunnel_id $T peer_tunnel_id $PT encap udp local $localip remote $remote udp_sport $l2port udp_dport $l2port || exit 1"
+      else
+        echo "  ip l2tp add tunnel tunnel_id $T peer_tunnel_id $PT encap ip local $localip remote $remote || exit 1"
+      fi
+      echo "  ip l2tp add session name \"\$IFACE\" tunnel_id $T session_id $S peer_session_id $PS || exit 1"
+    else
+      echo "  ip link add \"\$IFACE\" type $mode local $localip remote $remote ttl $ttl$keyopt || exit 1"
+    fi
     if [[ "$mode" == sit ]]; then
       echo "  ip -6 addr add $addr dev \"\$IFACE\""
     else
       echo "  ip addr add $addr dev \"\$IFACE\""
     fi
-    echo '  ip link set dev "$IFACE" mtu 1400 up'
+    echo "  ip link set dev \"\$IFACE\" mtu $mtu up"
     echo '  [[ -f "$FW" ]] && bash "$FW" up'
     echo '  return 0'
     echo '}'
@@ -562,7 +784,8 @@ build_kernel() {
   } >"$f"
   chmod 700 "$f"
 
-  save_meta "$name" KIND=kernel ROLE="$role" MODE="$mode" HOST="$remote" LOCALIP="$localip" PEER="$peer" IFACE="$iface"
+  save_meta "$name" KIND=kernel ROLE="$role" MODE="$mode" HOST="$remote" LOCALIP="$localip" PEER="$peer" \
+    IFACE="$iface" MTU="$mtu" TTL="$ttl" FWD="${fwd:-}" TARGET="$target"
   write_unit "$name" "kernel tunnel $name ($mode, $role)" <<EOF
 Type=oneshot
 RemainAfterExit=yes
@@ -573,32 +796,61 @@ EOF
 
 create_kernel() {
   ensure_base || return 1
-  local pick role name mode localip remote prefix="10.99.0" idx fwd=""
+  local pick role name mode localip remote prefix="10.99.0" idx=0 fwd="" target=""
+  local mtu=1400 ttl=255 gkey="" l2enc="udp" l2port=5555 l2id=1000
   choose pick "Which side is this server?" \
     "server - gets the .1 address (usually the Iran side)" \
     "client - gets the .2 address (usually the foreign side)"
   role="${pick%% *}"
   ask_name
   choose pick "Tunnel type:" \
-    "gre  - GRE (highest throughput)" \
-    "ipip - IP-in-IP (lowest overhead, IPv4 only)" \
-    "sit  - 6in4 (IPv6 over IPv4)"
+    "gre    - GRE, layer 3 (highest throughput)" \
+    "gretap - GRE, layer 2 (Ethernet over GRE)" \
+    "ipip   - IP-in-IP (lowest overhead, IPv4 only)" \
+    "sit    - 6in4 (IPv6 over IPv4)" \
+    "l2tp   - L2TPv3 (over UDP or raw IP)"
   mode="${pick%% *}"
-  ask_valid localip "This server's IP" "$(default_local_ip)" valid_ipv4
-  ask_valid remote "The OTHER server's public IP" "" valid_ipv4
+  ask_valid localip "This server's real IP" "$(default_local_ip)" valid_ipv4
+  ask_valid remote "The OTHER server's real IP" "" valid_ipv4
   if [[ "$mode" == sit ]]; then
-    idx=$((1 + RANDOM % 200)); prefix=""
-    ask_valid idx "IPv6 tunnel id (1-250, same on both sides)" "$idx" valid_port
+    prefix=""; idx=$((1 + RANDOM % 200))
+    ask_valid idx "IPv6 tunnel id (1-250, same on both sides)" "$idx" valid_idx
   else
-    idx=0
-    ask_valid prefix "Private tunnel network (first 3 octets)" "10.99.0" valid_prefix
-    [[ "$role" == server ]] && ask_valid fwd "Ports to forward through the tunnel (Enter = none)" "" valid_fwd_ports
+    ask_valid prefix "Private tunnel network (first 3 octets; server=.1 client=.2)" "10.99.0" valid_prefix
+  fi
+  if ask_yes "Advanced options (MTU, TTL, keys, ids)?"; then
+    ask_valid mtu "MTU" "$mtu" valid_mtu
+    if [[ "$mode" != l2tp ]]; then
+      ask_valid ttl "TTL" "$ttl" valid_ttl
+    fi
+    if [[ "$mode" == gre || "$mode" == gretap ]]; then
+      ask_valid gkey "GRE key (a number, Enter = none; same on both sides)" "" valid_key
+    fi
+    if [[ "$mode" == l2tp ]]; then
+      choose pick "L2TP encapsulation:" \
+        "udp - works through most NATs" \
+        "ip  - raw IP, lower overhead"
+      l2enc="${pick%% *}"
+      if [[ "$l2enc" == udp ]]; then
+        ask_valid l2port "L2TP UDP port (same on both sides)" "$l2port" valid_port
+      fi
+      ask_valid l2id "L2TP id (same on both sides)" "$l2id" valid_id
+    fi
+  fi
+  if [[ "$role" == server && "$mode" != sit ]]; then
+    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443,53/udp; Enter = none)" "" valid_fwd_ports
+    if [[ -n "$fwd" ]]; then
+      ask_valid target "Deliver them to (address on the other side)" "$prefix.2" valid_ipv4
+    fi
   fi
   build_kernel || return 1
   sleep 1
   ok "Tunnel '$name' created. Service: $(systemctl is-active "$APP-$name.service")"
   echo
-  echo "On the OTHER server create the opposite side with the same type and network."
+  echo "On the OTHER server create the opposite side with the same type, network and options."
+  if [[ -n "$fwd" ]]; then
+    echo "Forwarding $fwd -> ${target:-$prefix.2}: the service on the other side must listen on that address (or 0.0.0.0)."
+  fi
   warn "Your provider/firewall must allow the protocol ($mode) between both servers."
   return 0
 }
@@ -623,13 +875,13 @@ show_status_all() {
   local n
   for n in "${TUNNELS[@]}"; do
     load_meta "$n"
-    printf '%-14s %-8s %-8s %-10s %s\n' "$n" "$KIND" "$ROLE" "$MODE" "$(status_of "$n")"
+    printf '%-14s %-8s %-8s %-10s %s\n' "$n" "$KIND" "$ROLE" "$(type_label)" "$(status_of "$n")"
   done
 }
 
 delete_tunnel() {
-  local n="$1" iface
-  load_meta "$n"; iface="${IFACE:-}"
+  local n="$1"
+  load_meta "$n"
   systemctl disable --now "$APP-$n.service" >/dev/null 2>&1
   rm -f "$UNIT_DIR/$APP-$n.service"
   systemctl daemon-reload
@@ -638,45 +890,129 @@ delete_tunnel() {
     rm -f "$WG_DIR/tt-$n.conf"
   fi
   [[ -f "$TDIR/$n.fw" ]] && bash "$TDIR/$n.fw" down >/dev/null 2>&1
-  [[ "$KIND" == kernel && -n "$iface" ]] && ip tunnel del "$iface" >/dev/null 2>&1
+  [[ -f "$TDIR/$n.sh" ]] && bash "$TDIR/$n.sh" down >/dev/null 2>&1
   rm -f "$TDIR/$n".{meta,toml,fw,sh} "$CONF/certs/$n".{crt,key}
   ok "Tunnel '$n' removed."
+}
+
+health_check() { # health_check peer_ip
+  local peer="$1" out loss rtt vals mn av mx jt
+  local -a cmd=(ping -c 20 -i 0.2 -W 2)
+  command -v ping >/dev/null 2>&1 || { err "'ping' is not installed."; return 1; }
+  [[ "$peer" == *:* ]] && cmd+=(-6)
+  info "Sending 20 pings through the tunnel to $peer ..."
+  out="$("${cmd[@]}" "$peer" 2>&1)" || true
+  loss="$(grep -oE '[0-9.]+% packet loss' <<<"$out" | head -n1)"
+  rtt="$(grep -E '^(rtt|round-trip)' <<<"$out" | head -n1)"
+  if [[ -z "$rtt" ]]; then
+    err "No replies. Is the other side created and running? Check the firewall and the logs."
+    return 1
+  fi
+  vals="${rtt#*= }"; vals="${vals%% *}"
+  IFS=/ read -r mn av mx jt <<<"$vals"
+  echo "Loss    : ${loss:-unknown}"
+  echo "Latency : min $mn / avg $av / max $mx ms"
+  echo "Jitter  : $jt ms"
+  if [[ "${loss%%%*}" != "0" && "${loss%%%*}" != "0.0" ]]; then
+    warn "Packet loss detected. Try another tunnel type, a lower MTU, or another port."
+  elif awk -v j="$jt" 'BEGIN{exit !(j+0 > 10)}'; then
+    warn "Jitter is high (> 10 ms). Games and calls will feel unstable."
+  else
+    ok "The link looks healthy."
+  fi
 }
 
 test_tunnel() {
   local n="$1"
   load_meta "$n"
-  if [[ "$KIND" == stream ]]; then
+  if [[ "$KIND" == stream || "$KIND" == frp ]]; then
     echo "Service: $(status_of "$n")"
-    if [[ "$ROLE" == server ]]; then ss -ltn 2>/dev/null | grep -E ":$PORT\b" || warn "Nothing is listening on $PORT."; fi
+    if [[ "$ROLE" == server ]]; then ss -lntu 2>/dev/null | grep -E ":$PORT\b" || warn "Nothing is listening on $PORT."; fi
     journalctl -u "$APP-$n.service" -n 8 --no-pager 2>/dev/null
   else
-    echo "Pinging the other side of the tunnel ($PEER)..."
-    if [[ "$PEER" == *:* ]]; then ping -6 -c 4 -W 2 "$PEER"; else ping -c 4 -W 2 "$PEER"; fi
+    health_check "$PEER"
   fi
 }
 
 show_info() {
   local n="$1"
   load_meta "$n"
-  echo "Name   : $n"
-  echo "Kind   : $KIND"
-  echo "Role   : $ROLE"
-  echo "Type   : $MODE"
-  [[ -n "${HOST:-}" ]] && echo "Remote : $HOST"
-  [[ -n "${PORT:-}" ]] && echo "Port   : $PORT"
-  [[ -n "${PEER:-}" ]] && echo "Peer   : $PEER (tunnel address)"
-  [[ -n "${TOKEN:-}" ]] && echo "Token  : $TOKEN"
-  echo "Status : $(status_of "$n")"
+  echo "Name    : $n"
+  echo "Kind    : $KIND"
+  echo "Role    : $ROLE"
+  echo "Type    : $(type_label)"
+  [[ -n "${HOST:-}" ]] && echo "Remote  : $HOST"
+  [[ -n "${LOCALIP:-}" ]] && echo "Local   : $LOCALIP"
+  [[ -n "${PORT:-}" ]] && echo "Port    : $PORT"
+  [[ -n "${PEER:-}" ]] && echo "Peer    : $PEER (tunnel address)"
+  [[ -n "${MTU:-}" ]] && echo "MTU     : $MTU"
+  [[ -n "${TTL:-}" ]] && echo "TTL     : $TTL"
+  [[ -n "${PORTS:-}" ]] && echo "Ports   : $PORTS"
+  [[ -n "${LINKS:-}" ]] && echo "Links   : $LINKS"
+  [[ "$KIND" == frp && -n "${TARGET:-}" ]] && echo "Lands on: $TARGET (this server)"
+  [[ -n "${FWD:-}" ]] && echo "Forward : $FWD -> ${TARGET:-$PEER}"
+  [[ -n "${TOKEN:-}" ]] && echo "Token   : $TOKEN"
+  echo "Status  : $(status_of "$n")"
+}
+
+edit_ports() { # edit_ports name
+  local n="$1" newp="" cur target
+  load_meta "$n"
+  if [[ "$KIND" == frp ]]; then
+    [[ "$ROLE" == client ]] || { warn "For kcp/quic tunnels the ports are set on the client side."; return 1; }
+  else
+    [[ "$ROLE" == server ]] || { warn "Only the server side opens ports."; return 1; }
+  fi
+  case "$KIND" in
+    frp)
+      cur="${PORTS:-}"
+      ask_valid newp "Ports to open on the server (current: $cur)" "$cur" valid_fwd_nonempty
+      {
+        local name="$n" role="$ROLE" transport="$MODE" port="$PORT" host="${HOST:-}" token="$TOKEN" ports="$newp" target="${TARGET:-127.0.0.1}"
+        gen_frp_conf
+      }
+      meta_set "$n" PORTS "$newp"
+      systemctl restart "$APP-$n.service" && ok "Ports updated and tunnel restarted."
+      ;;
+    stream)
+      cur="${PORTS:-}"
+      ask_valid newp "Ports to open for users (current: $cur)" "$cur" valid_bh_ports
+      {
+        local name="$n" role="$ROLE" transport="$MODE" port="$PORT" host="${HOST:-}" token="$TOKEN" ports="$newp" links="${LINKS:-8}"
+        gen_backhaul_conf
+      }
+      meta_set "$n" PORTS "$newp"
+      systemctl restart "$APP-$n.service" && ok "Ports updated and tunnel restarted."
+      ;;
+    tun | kernel)
+      if [[ "$MODE" == sit ]]; then warn "Port forwarding is not available for sit tunnels."; return 1; fi
+      cur="${FWD:-}"
+      ask_valid newp "Forwarded ports (current: ${cur:-none}; '-' clears)" "$cur" valid_fwd_or_clear
+      [[ "$newp" == "-" ]] && newp=""
+      target="${TARGET:-$PEER}"
+      if [[ -n "$newp" ]]; then ask_valid target "Deliver them to (address on the other side)" "$target" valid_ipv4; fi
+      [[ -f "$TDIR/$n.fw" ]] && bash "$TDIR/$n.fw" down >/dev/null 2>&1
+      if [[ -n "$newp" ]]; then gen_fw_script "$n" "$target" "$newp"; else rm -f "$TDIR/$n.fw"; fi
+      meta_set "$n" FWD "$newp"
+      meta_set "$n" TARGET "$target"
+      if [[ "$(status_of "$n")" == active && -f "$TDIR/$n.fw" ]]; then bash "$TDIR/$n.fw" up; fi
+      ok "Forwarded ports updated."
+      ;;
+  esac
+}
+
+can_edit_ports() { # uses KIND ROLE (after load_meta)
+  if [[ "${KIND:-}" == frp ]]; then [[ "${ROLE:-}" == client ]]; else [[ "${ROLE:-}" == server ]]; fi
 }
 
 tunnel_menu() {
-  local n="$1" pick
+  local n="$1" pick yn
   while true; do
+    load_meta "$n"
     echo; echo "--- Tunnel: $n ($(status_of "$n")) ---"
-    echo " 1) Info        2) Restart     3) Stop"
-    echo " 4) Logs        5) Live logs   6) Test"
-    echo " 7) Delete      0) Back"
+    echo " 1) Info          2) Restart       3) Stop"
+    echo " 4) Logs          5) Live logs     6) Health check"
+    if can_edit_ports; then echo " 7) Edit ports    8) Delete        0) Back"; else echo " 8) Delete        0) Back"; fi
     IFS= read -r -p "Choose: " pick || die "Input closed."
     case "$pick" in
       1) show_info "$n" ;;
@@ -685,7 +1021,8 @@ tunnel_menu() {
       4) journalctl -u "$APP-$n.service" -n 60 --no-pager ;;
       5) trap 'true' INT; journalctl -fu "$APP-$n.service"; trap - INT ;;
       6) test_tunnel "$n" ;;
-      7) local yn; ask yn "Type 'yes' to delete '$n'" ""; if [[ "$yn" == yes ]]; then delete_tunnel "$n"; return; fi ;;
+      7) if can_edit_ports; then edit_ports "$n"; else warn "Invalid choice."; fi ;;
+      8) ask yn "Type 'yes' to delete '$n'" ""; if [[ "$yn" == yes ]]; then delete_tunnel "$n"; return; fi ;;
       0) return ;;
       *) warn "Invalid choice." ;;
     esac
@@ -741,9 +1078,9 @@ main_menu() {
     echo "${C_B}=========================================${C_0}"
     echo "  Toolstunnel v$VERSION"
     echo "${C_B}=========================================${C_0}"
-    echo " 1) Create stream tunnel   (tcpmux / tcp / ws / wss / wsmux / wssmux)"
+    echo " 1) Create stream tunnel   (tcpmux / tcp / ws / wss / wsmux / wssmux / kcp / quic)"
     echo " 2) Create TUN tunnel      (tun-tcp / tun-udp / tun-icmp)"
-    echo " 3) Create kernel tunnel   (GRE / IPIP / SIT)"
+    echo " 3) Create kernel tunnel   (GRE / GRETAP / IPIP / SIT / L2TP)"
     echo " 4) Manage tunnels"
     echo " 5) Update script"
     echo " 6) Uninstall"
@@ -765,7 +1102,7 @@ main_menu() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-}" in
     -v | --version | version) echo "Toolstunnel $VERSION" ;;
-    status) need_root; show_status_all ;;
+    status | list) need_root; show_status_all ;;
     *) main_menu ;;
   esac
 fi
