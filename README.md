@@ -23,9 +23,10 @@ Run it as **root** on **both** servers. Next time just run `toolstunnel`.
 | Stream tunnel | `tcpmux` `tcp` `ws` `wss` `wsmux` `wssmux` | [Backhaul](https://github.com/Musixal/Backhaul) |
 | Stream tunnel | `kcp` · `quic` (UDP) | [frp](https://github.com/fatedier/frp) |
 | TUN tunnel | `tun-tcp` (fake-TCP) · `tun-udp` · `tun-icmp` | WireGuard + [udp2raw](https://github.com/wangyu-/udp2raw) |
+| TUN tunnel | `tun-ip` (GRE or IPIP carrier) | WireGuard inside a kernel IP tunnel |
 | Kernel tunnel | `gre` · `gretap` · `ipip` · `sit` · `l2tp` | Linux kernel (`ip link`, `ip l2tp`) |
 
-TUN and kernel tunnels give both servers a **private network** (default `10.88.0.1` ↔ `10.88.0.2`, or `10.99.0.1` ↔ `10.99.0.2`). Traffic is encrypted in TUN tunnels (WireGuard); kernel tunnels are **not** encrypted — encrypt inside the service (TLS) if you need it.
+TUN and kernel tunnels give both servers a **private network** (default `10.10.10.1/24` on the server ↔ `10.10.10.2/24` on the client; you can change both). Traffic is encrypted in TUN tunnels (WireGuard); kernel tunnels are **not** encrypted — encrypt inside the service (TLS) if you need it.
 
 | Type | Layer | Good for |
 | --- | --- | --- |
@@ -37,12 +38,13 @@ TUN and kernel tunnels give both servers a **private network** (default `10.88.0
 | `tun-tcp` | 3 | Looks like TCP on the wire |
 | `tun-udp` | 3 | Plain UDP, fast |
 | `tun-icmp` | 3 | When only ping is allowed |
+| `tun-ip` | 3 | Encrypted, carried as raw IP packets (protocol 47 or 4) |
 
 ## How to use
 
 1. Install on both servers.
 2. On the listening server (usually Iran) choose **server**. On the other (usually abroad) choose **client**.
-3. Use the same type, port, network and **token** on both sides. The script prints the values to copy.
+3. Use the same type, port and **token** on both sides. The script prints the values to copy, including the two TUN addresses (swapped for the other side).
 4. Open the chosen port in the firewall of the server side.
 5. Open **Manage tunnels → Health check** to see loss, latency and jitter.
 
@@ -55,10 +57,14 @@ TUN and kernel tunnels give both servers a **private network** (default `10.88.0
 | Type | all | See the table above |
 | Real IPs of both servers | kernel | This server's IP is detected automatically |
 | Server IP and port, token | stream, TUN | Token must match on both sides |
-| Private tunnel network | TUN, kernel | First 3 octets, server = `.1`, client = `.2` |
-| **Advanced options** (y/N) | stream, TUN, kernel | Parallel links · MTU · TTL · GRE key · L2TP encapsulation, port and id |
+| **TUN Local / Remote Address** (CIDR) | TUN, kernel | Defaults `10.10.10.1/24` ↔ `10.10.10.2/24` (reversed on the client). For another tunnel on the same server the next free network (`10.10.11.x`, …) is suggested |
+| **Advanced options** (y/N) | stream, TUN, kernel | Parallel links · MTU · **speed limit (Mbps)** · TTL · GRE key · L2TP encapsulation, port and id |
 | Ports to forward | server side | See below |
 | Deliver them to | server side | Address on the other side, default = its tunnel address |
+
+## Network tuning (optional)
+
+Main menu → **Network tuning** applies a kernel profile for the whole server: `balanced` (BBR + fq), `fast` (big buffers) or `latency` (small buffers + fq_codel). The old values are saved first, and **reset** restores them.
 
 ## Forwarding ports
 
@@ -80,12 +86,18 @@ Change the list later with **Manage tunnels → your tunnel → Edit ports** (no
 
 The service on the other side must listen on the delivery address (or on `0.0.0.0`).
 
+## Look and feel
+
+The main menu shows a banner, your server IP, location and datacenter, which cores are installed and how many tunnels are active. The IP details come from one request to `ipinfo.io` per run; set `TT_NO_IPINFO=1` to turn it off.
+
 ## Notes
 
 - Binaries are downloaded at install time from the official releases of each project; they are not stored in this repository. Their own licenses apply.
-- TUN tunnels (udp2raw) currently need an **x86_64** server. Stream and kernel tunnels also work on ARM64.
+- `tun-tcp`, `tun-udp` and `tun-icmp` (udp2raw) currently need an **x86_64** server. All other types also work on ARM64.
 - The **token** is a password: WireGuard keys are derived from it. Use the generated one (32 random characters).
 - `tun-icmp` makes the server ignore normal pings while the tunnel runs.
+- `tun-ip` needs both servers to have a real public IP (no NAT) and your provider to allow GRE (47) or IPIP (4). It also works on ARM64.
+- The **speed limit** caps what this server sends into the tunnel; set it on both sides for a two-way cap.
 - GRE, GRETAP, IPIP, SIT and L2TP need your provider to allow those protocols between the two servers.
 - `kcp` and `quic` need UDP to pass between the two servers. `quic` collapses on lossy paths; use `kcp` or `tcpmux` there.
 - **Parallel links** (Advanced options on Backhaul tunnels) opens several TCP links at once, which helps when a network throttles each connection. It is the closest thing to a bonded-TCP mode here.
@@ -129,9 +141,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 | تونل جریانی (Stream) | `tcpmux` `tcp` `ws` `wss` `wsmux` `wssmux` | Backhaul |
 | تونل جریانی (Stream) | `kcp` · `quic` (روی UDP) | frp |
 | تونل TUN | `tun-tcp` (فیک‌تی‌سی‌پی) · `tun-udp` · `tun-icmp` | WireGuard + udp2raw |
+| تونل TUN | `tun-ip` (حامل GRE یا IPIP) | WireGuard داخل تونل IP کرنل |
 | تونل کرنلی | `gre` · `gretap` · `ipip` · `sit` · `l2tp` | خود کرنل لینوکس |
 
-تونل‌های TUN و کرنلی یک **شبکهٔ خصوصی** بین دو سرور می‌سازند (پیش‌فرض `10.88.0.1` ↔ `10.88.0.2` یا `10.99.0.1` ↔ `10.99.0.2`). تونل TUN رمزنگاری دارد (WireGuard)؛ تونل‌های کرنلی **رمزنگاری ندارند**، اگر لازم است داخل خود سرویس (TLS) انجام بده.
+تونل‌های TUN و کرنلی یک **شبکهٔ خصوصی** بین دو سرور می‌سازند (پیش‌فرض `10.10.10.1/24` روی server ↔ `10.10.10.2/24` روی client؛ هر دو قابل تغییرند). تونل TUN رمزنگاری دارد (WireGuard)؛ تونل‌های کرنلی **رمزنگاری ندارند**، اگر لازم است داخل خود سرویس (TLS) انجام بده.
 
 | نوع | لایه | مناسب برای |
 | --- | --- | --- |
@@ -143,6 +156,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 | `tun-tcp` | ۳ | روی شبکه شبیه TCP دیده می‌شود |
 | `tun-udp` | ۳ | UDP ساده و سریع |
 | `tun-icmp` | ۳ | وقتی فقط پینگ باز است |
+| `tun-ip` | ۳ | رمزنگاری‌شده، روی بسته‌های IP خام (پروتکل ۴۷ یا ۴) |
 
 ## طرز استفاده
 
@@ -159,9 +173,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 - **نوع** تونل
 - **IP واقعی هر دو سرور** (فقط تونل کرنلی؛ IP همین سرور خودکار پیدا می‌شود)
 - **IP و پورت سرور و توکن** (تونل Stream و TUN)
-- **شبکهٔ خصوصی تونل** (سه عدد اول؛ server = `.1` و client = `.2`)
-- **Advanced options** (پیش‌فرض نه): تعداد لینک موازی، MTU، TTL، کلید GRE، نوع و پورت و id در L2TP
+- **TUN Local / Remote Address** (با CIDR؛ پیش‌فرض `10.10.10.1/24` ↔ `10.10.10.2/24` و روی client برعکس). برای تونل دوم روی همان سرور، شبکهٔ آزاد بعدی (`10.10.11.x` و ...) پیشنهاد می‌شود
+- **Advanced options** (پیش‌فرض نه): تعداد لینک موازی، MTU، **محدودیت سرعت (Mbps)**، TTL، کلید GRE، نوع و پورت و id در L2TP
 - **پورت‌هایی که فوروارد شوند** (سمت server) و **آدرس مقصد** در سمت دیگر
+
+## تیونینگ شبکه (اختیاری)
+
+منوی اصلی ← **Network tuning** یک پروفایل کرنلی برای کل سرور اعمال می‌کند: `balanced` (‏BBR + fq)، `fast` (بافر بزرگ) یا `latency` (بافر کوچک + fq_codel). مقدارهای قبلی اول ذخیره می‌شوند و گزینهٔ **reset** برشان می‌گرداند.
 
 ## فوروارد پورت
 
@@ -183,12 +201,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 
 سرویس سمت دیگر باید روی آدرس مقصد (یا `0.0.0.0`) گوش بدهد.
 
+## ظاهر منو
+
+منوی اصلی یک بنر، IP و موقعیت و دیتاسنتر سرور، هسته‌های نصب‌شده و تعداد تونل‌های فعال را نشان می‌دهد. اطلاعات IP با یک درخواست به `ipinfo.io` در هر بار اجرا گرفته می‌شود؛ با `TT_NO_IPINFO=1` خاموشش کن.
+
 ## نکته‌ها
 
 - باینری‌ها موقع نصب از ریلیز رسمی هر پروژه دانلود می‌شوند و داخل این ریپو نیستند؛ لایسنس خودشان اعمال می‌شود.
-- تونل TUN فعلاً فقط روی سرور **x86_64** کار می‌کند.
+- `tun-tcp` و `tun-udp` و `tun-icmp` (‏udp2raw) فعلاً فقط روی سرور **x86_64** کار می‌کنند. بقیهٔ نوع‌ها روی ARM64 هم کار می‌کنند.
 - **توکن** مثل رمز عبور است و کلیدهای WireGuard از آن ساخته می‌شود؛ از توکن خودکار (۳۲ کاراکتر) استفاده کن.
 - `tun-icmp` تا وقتی تونل روشن است جواب پینگ معمولی سرور را قطع می‌کند.
+- `tun-ip` به IP عمومی واقعی روی هر دو سرور (بدون NAT) و اجازهٔ GRE (۴۷) یا IPIP (۴) از طرف دیتاسنتر نیاز دارد. روی ARM64 هم کار می‌کند.
+- **محدودیت سرعت** فقط چیزی را که این سرور وارد تونل می‌کند محدود می‌کند؛ برای محدودیت دوطرفه روی هر دو سمت بگذار.
 - برای GRE، GRETAP، IPIP، SIT و L2TP باید دیتاسنتر این پروتکل‌ها را بین دو سرور اجازه بدهد.
 - `kcp` و `quic` به عبور UDP بین دو سرور نیاز دارند. `quic` روی مسیر پر از loss ضعیف می‌شود؛ آنجا `kcp` یا `tcpmux` بزن.
 - **لینک موازی** (Advanced options در تونل‌های Backhaul) چند اتصال TCP هم‌زمان باز می‌کند و وقتی شبکه هر اتصال را جداگانه کند می‌کند کمک می‌کند. نزدیک‌ترین چیز به حالت bonded-TCP همین است.
