@@ -4,6 +4,8 @@
 #
 #   1) Stream tunnels : Backhaul  (tcp, tcpmux, ws, wss, wsmux, wssmux)
 #                       frp       (kcp, quic)
+#                       quantum   (frp KCP carried inside fake-TCP packets via udp2raw)
+#                       optional TLS fragmenting for wss/wssmux clients (small local proxy)
 #   2) TUN tunnels    : WireGuard + udp2raw / GRE  (tun-tcp, tun-udp, tun-icmp, tun-ip)
 #   3) Kernel tunnels : GRE / GRETAP / IPIP / SIT / L2TPv3
 #
@@ -13,7 +15,7 @@
 set -u
 
 APP="toolstunnel"
-VERSION="0.5.0"
+VERSION="0.8.2"
 BASE="${TT_BASE:-/opt/toolstunnel}"
 BIN="$BASE/bin"
 CONF="${TT_CONF:-/etc/toolstunnel}"
@@ -139,7 +141,11 @@ same_subnet() { # same_subnet a/len b/len -> two different hosts of one network
   (((ia & mask) == (ib & mask)))
 }
 
-valid_bh_ports() { [[ "${1:-}" =~ ^[0-9]+(-[0-9]+)?(=[0-9]+)?(,[0-9]+(-[0-9]+)?(=[0-9]+)?)*$ ]]; }
+valid_bh_ports() { # Backhaul syntax: 443 | 443-600 | 443-600:5201 | 4000=5000 | 127.0.0.2:443=5201 | 443=1.1.1.1:5201
+  local ip='[0-9]{1,3}(\.[0-9]{1,3}){3}' item
+  item="(${ip}:)?[0-9]+(-[0-9]+)?([=:](${ip}:)?[0-9]+)?"
+  [[ "${1:-}" =~ ^${item}(,${item})*$ ]]
+}
 
 # Forward list: 2052 | 2052/udp | 2052/both | 8443=443 | 8443=443/udp  (comma separated, empty = none)
 valid_fwd_ports() {
@@ -155,6 +161,25 @@ valid_fwd_ports() {
   done
   return 0
 }
+# TUN / kernel forwarding also accepts ranges: 1000-2000 | 1000-2000=443 | 1000-2000/udp
+valid_fwd_ranges() {
+  local s="${1:-}" spec base p a b
+  local -a specs=() nums=()
+  [[ -z "$s" ]] && return 0
+  [[ "$s" =~ ^[0-9]+(-[0-9]+)?(=[0-9]+)?(/(tcp|udp|both))?(,[0-9]+(-[0-9]+)?(=[0-9]+)?(/(tcp|udp|both))?)*$ ]] || return 1
+  IFS=',' read -ra specs <<<"$s"
+  for spec in "${specs[@]}"; do
+    base="${spec%%/*}"
+    IFS='=-' read -ra nums <<<"$base"
+    for p in "${nums[@]}"; do valid_port "$p" || return 1; done
+    if [[ "${base%%=*}" == *-* ]]; then
+      a="${base%%-*}"; b="${base%%=*}"; b="${b##*-}"
+      ((10#$a <= 10#$b)) || return 1
+    fi
+  done
+  return 0
+}
+valid_fwd_ranges_or_clear() { [[ "${1:-}" == "-" ]] || valid_fwd_ranges "${1:-}"; }
 valid_fwd_nonempty() { [[ -n "${1:-}" ]] && valid_fwd_ports "$1"; }
 valid_fwd_or_clear() { [[ "${1:-}" == "-" ]] || valid_fwd_ports "${1:-}"; }
 
@@ -314,7 +339,7 @@ meta_set() { # meta_set name KEY VALUE  (update or add one field)
 }
 
 load_meta() { # load_meta name
-  unset KIND ROLE MODE PORT HOST TOKEN PEER LOCALIP IFACE MTU TTL FWD TARGET PORTS LINKS LIMIT CARRIER LADDR
+  unset KIND ROLE MODE PORT HOST TOKEN PEER LOCALIP IFACE MTU TTL FWD TARGET PORTS LINKS LIMIT CARRIER LADDR IPORT FRAG FPORT UDP
   # shellcheck disable=SC1090
   source "$TDIR/$1.meta"
 }
@@ -392,7 +417,7 @@ EOF
 gen_fw_script() { # gen_fw_script name target_ip "ports csv"
   local name="$1" target="$2" ports="$3" f="$TDIR/$1.fw"
   local -a specs=()
-  local spec base suffix src dst protos proto
+  local spec base suffix src dst protos proto dport to
   IFS=',' read -ra specs <<<"$ports"
   {
     echo '#!/usr/bin/env bash'
@@ -404,13 +429,15 @@ gen_fw_script() { # gen_fw_script name target_ip "ports csv"
       base="${spec%%/*}"; suffix=""
       [[ "$spec" == */* ]] && suffix="${spec#*/}"
       src="${base%%=*}"; dst="${base##*=}"
+      dport="${src/-/:}"
+      if [[ "$src" == *-* && "$base" != *=* ]]; then to="$target"; else to="$target:$dst"; fi
       case "$suffix" in
         udp)  protos="udp" ;;
         both) protos="tcp udp" ;;
         *)    protos="tcp" ;;
       esac
       for proto in $protos; do
-        echo "iptables -t nat \$OP PREROUTING -p $proto --dport $src -j DNAT --to-destination $target:$dst || true"
+        echo "iptables -t nat \$OP PREROUTING -p $proto --dport $dport -j DNAT --to-destination $to || true"
       done
     done
     echo "iptables -t nat \$OP POSTROUTING -d $target -j MASQUERADE || true"
@@ -424,6 +451,102 @@ gen_fw_script() { # gen_fw_script name target_ip "ports csv"
 # ---------------------------------------------------------------------
 #  1) Stream tunnels (Backhaul)
 # ---------------------------------------------------------------------
+ensure_python() {
+  command -v python3 >/dev/null 2>&1 && return 0
+  info "Installing python3..."
+  pkg_install python3 -- python3 || true
+  command -v python3 >/dev/null 2>&1 || { err "Could not install python3."; return 1; }
+}
+
+# Small local proxy: sends the first TLS record (ClientHello) in small pieces.
+install_fragproxy() {
+  ensure_python || return 1
+  mkdir -p "$BIN"
+  cat >"$BIN/ttfrag.py" <<'PYEOF'
+import asyncio, random, socket, sys
+
+LISTEN, THOST, TPORT = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+CMIN, CMAX = 20, 80      # bytes per fragment
+DMIN, DMAX = 2, 10       # ms between fragments
+
+
+def nodelay(w):
+    sk = w.get_extra_info("socket")
+    if sk is not None:
+        try:
+            sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+
+def close(w):
+    try:
+        w.close()
+    except Exception:
+        pass
+
+
+async def pipe(r, w):
+    try:
+        while True:
+            d = await r.read(65536)
+            if not d:
+                break
+            w.write(d)
+            await w.drain()
+    except Exception:
+        pass
+    finally:
+        close(w)
+
+
+async def handle(cr, cw):
+    try:
+        ur, uw = await asyncio.wait_for(asyncio.open_connection(THOST, TPORT), 10)
+    except Exception:
+        close(cw)
+        return
+    nodelay(uw)
+    nodelay(cw)
+    try:
+        first = await asyncio.wait_for(cr.read(65536), 30)
+    except Exception:
+        first = b""
+    if not first:
+        close(cw)
+        close(uw)
+        return
+    try:
+        if first[0] == 0x16:  # TLS handshake record: send it in small pieces
+            i = 0
+            while i < len(first):
+                n = random.randint(CMIN, CMAX)
+                uw.write(first[i:i + n])
+                await uw.drain()
+                i += n
+                if i < len(first):
+                    await asyncio.sleep(random.uniform(DMIN, DMAX) / 1000.0)
+        else:
+            uw.write(first)
+            await uw.drain()
+    except Exception:
+        close(cw)
+        close(uw)
+        return
+    await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+
+
+async def main():
+    srv = await asyncio.start_server(handle, "127.0.0.1", LISTEN)
+    async with srv:
+        await srv.serve_forever()
+
+
+asyncio.run(main())
+PYEOF
+  chmod 755 "$BIN/ttfrag.py"
+}
+
 ports_toml() { printf '[%s]' "$(printf '%s' "$1" | sed 's/[^,][^,]*/"&"/g; s/,/, /g')"; }
 
 gen_cert() { # gen_cert name
@@ -448,17 +571,23 @@ gen_backhaul_conf() {
       echo "bind_addr = \"0.0.0.0:$port\""
     else
       echo "[client]"
-      echo "remote_addr = \"$host:$port\""
+      if [[ "${frag:-0}" == 1 ]]; then
+        echo "remote_addr = \"127.0.0.1:$fport\""
+      else
+        echo "remote_addr = \"$host:$port\""
+      fi
     fi
     echo "transport = \"$transport\""
     echo "token = \"$token\""
     echo "log_level = \"info\""
     echo "sniffer = false"
+    echo "web_port = 0"
     echo "nodelay = true"
     echo "keepalive_period = 75"
     if [[ "$role" == server ]]; then
       echo "heartbeat = 40"
       echo "channel_size = 2048"
+      [[ "${udp:-0}" == 1 ]] && echo "accept_udp = true"
       echo "ports = $(ports_toml "$ports")"
     else
       echo "connection_pool = ${links:-8}"
@@ -486,14 +615,40 @@ build_backhaul() {
     gen_cert "$name" || { err "Could not create a TLS certificate."; return 1; }
   fi
   gen_backhaul_conf
-  save_meta "$name" KIND=stream ROLE="$role" MODE="$transport" PORT="$port" HOST="${host:-}" TOKEN="$token" PORTS="${ports:-}" LINKS="${links:-8}"
-  write_unit "$name" "stream tunnel $name ($transport, $role)" <<EOF
+  save_meta "$name" KIND=stream ROLE="$role" MODE="$transport" PORT="$port" HOST="${host:-}" TOKEN="$token" PORTS="${ports:-}" LINKS="${links:-8}" \
+    FRAG="${frag:-0}" FPORT="${fport:-}" UDP="${udp:-0}"
+  if [[ "${frag:-0}" == 1 && "$role" == client ]]; then
+    local run="$TDIR/$name.run"
+    cat >"$run" <<EOF
+#!/usr/bin/env bash
+# Toolstunnel: Backhaul client behind a local TLS-fragmenting proxy. Generated file.
+"$(command -v python3)" "$BIN/ttfrag.py" $fport $host $port &
+PX=\$!
+sleep 1
+"$BIN/backhaul" -c $TDIR/$name.toml &
+BH=\$!
+trap 'kill \$PX \$BH 2>/dev/null' EXIT TERM INT
+wait -n
+exit 1
+EOF
+    chmod 700 "$run"
+    write_unit "$name" "stream tunnel $name ($transport, $role, TLS fragment)" <<EOF
+Type=simple
+ExecStart=/bin/bash $run
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+EOF
+  else
+    rm -f "$TDIR/$name.run"
+    write_unit "$name" "stream tunnel $name ($transport, $role)" <<EOF
 Type=simple
 ExecStart=$BIN/backhaul -c $TDIR/$name.toml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 EOF
+  fi
 }
 
 # uses: name role transport port host token ports target
@@ -501,18 +656,28 @@ gen_frp_conf() {
   local f="$TDIR/$name.toml"
   local -a specs=()
   local spec base suffix src dst protos proto
+  # quantum = frp's KCP, but only on loopback; udp2raw carries it between the servers as fake-TCP
+  local tp="$transport" q=0 saddr="${host:-}" sport="$port"
+  if [[ "$transport" == quantum ]]; then tp="kcp"; q=1; saddr="127.0.0.1"; sport="${ipport:-}"; fi
   {
     if [[ "$role" == server ]]; then
-      echo 'bindAddr = "0.0.0.0"'
-      echo "bindPort = $port"
-      if [[ "$transport" == kcp ]]; then echo "kcpBindPort = $port"; else echo "quicBindPort = $port"; fi
+      if ((q)); then
+        echo 'bindAddr = "127.0.0.1"'
+        echo 'proxyBindAddr = "0.0.0.0"'
+        echo "bindPort = $sport"
+        echo "kcpBindPort = $sport"
+      else
+        echo 'bindAddr = "0.0.0.0"'
+        echo "bindPort = $port"
+        if [[ "$tp" == kcp ]]; then echo "kcpBindPort = $port"; else echo "quicBindPort = $port"; fi
+      fi
       echo "auth.token = \"$token\""
       echo 'log.level = "info"'
     else
-      echo "serverAddr = \"$host\""
-      echo "serverPort = $port"
+      echo "serverAddr = \"$saddr\""
+      echo "serverPort = $sport"
       echo "auth.token = \"$token\""
-      echo "transport.protocol = \"$transport\""
+      echo "transport.protocol = \"$tp\""
       echo 'loginFailExit = false'
       echo 'log.level = "info"'
       IFS=',' read -ra specs <<<"$ports"
@@ -555,19 +720,73 @@ LimitNOFILE=1048576
 EOF
 }
 
-create_frp_tunnel() { # called by create_stream for kcp / quic
-  install_frp || return 1
+# quantum: frp KCP over loopback + udp2raw fake-TCP between the two servers.
+# On the wire there is only TCP-looking traffic, no UDP.
+# uses: name role port host token ports target ipport
+build_quantum() {
+  local exe="frpc" run="$TDIR/$name.run" rawkey u2r
+  [[ "$role" == server ]] && exe="frps"
+  rawkey="$(tt_hex "raw:$token")"
+  transport="quantum"
+  gen_frp_conf
   if [[ "$role" == server ]]; then
-    ask_valid port "UDP port to listen on" "3080" valid_port
+    u2r="-s -l 0.0.0.0:$port -r 127.0.0.1:$ipport"
+  else
+    u2r="-c -l 127.0.0.1:$ipport -r $host:$port"
+  fi
+  cat >"$run" <<EOF
+#!/usr/bin/env bash
+# Toolstunnel quantum: KCP (frp) inside fake-TCP packets (udp2raw). Generated file.
+"$BIN/udp2raw" $u2r -k $rawkey --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a --keep-rule &
+RAW=\$!
+sleep 1
+"$BIN/$exe" -c $TDIR/$name.toml &
+APP=\$!
+trap 'kill \$RAW \$APP 2>/dev/null' EXIT TERM INT
+wait -n
+exit 1
+EOF
+  chmod 700 "$run"
+  save_meta "$name" KIND=frp ROLE="$role" MODE="quantum" PORT="$port" HOST="${host:-}" TOKEN="$token" \
+    PORTS="${ports:-}" TARGET="${target:-}" IPORT="$ipport"
+  write_unit "$name" "quantum tunnel $name ($role)" <<EOF
+Type=simple
+ExecStart=/bin/bash $run
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+EOF
+}
+
+create_frp_tunnel() { # called by create_stream for kcp / quic / quantum
+  local q=0
+  [[ "$transport" == quantum ]] && q=1
+  install_frp || return 1
+  if ((q)); then install_udp2raw || return 1; fi
+  if [[ "$role" == server ]]; then
+    if ((q)); then
+      ask_valid port "TCP port to listen on (fake-TCP; 443 looks like HTTPS)" "443" valid_port
+      if ss -lnt 2>/dev/null | grep -qE ":$port\b"; then
+        warn "A real service already listens on TCP $port. Pick another port or quantum will not work."
+      fi
+      ipport=$((30000 + RANDOM % 10000))
+    else
+      ask_valid port "UDP port to listen on" "3080" valid_port
+    fi
     ask_valid token "Token (Enter = auto-generate)" "$(gen_token)" valid_token
   else
     ask_valid host "IP or domain of the SERVER side" "" valid_host
-    ask_valid port "UDP port of the server" "3080" valid_port
+    if ((q)); then
+      ask_valid port "TCP port of the server" "443" valid_port
+      ipport=$((40000 + RANDOM % 10000))
+    else
+      ask_valid port "UDP port of the server" "3080" valid_port
+    fi
     ask_valid token "Token (must match the server)" "" valid_token
     ask_valid ports "Ports to open on the SERVER (e.g. 2052,8443=443,53/udp)" "" valid_fwd_nonempty
     ask_valid target "Where is the service on THIS server" "127.0.0.1" valid_host
   fi
-  build_frp || return 1
+  if ((q)); then build_quantum || return 1; else build_frp || return 1; fi
   sleep 2
   ok "Tunnel '$name' created. Service: $(systemctl is-active "$APP-$name.service")"
   echo
@@ -576,7 +795,11 @@ create_frp_tunnel() { # called by create_stream for kcp / quic
     echo "  transport : $transport"
     echo "  port      : $port"
     echo "  token     : $token"
-    echo "  (it will also ask which ports to open here; open UDP port $port in the firewall)"
+    if ((q)); then
+      echo "  (it will also ask which ports to open here; open TCP port $port in the firewall)"
+    else
+      echo "  (it will also ask which ports to open here; open UDP port $port in the firewall)"
+    fi
   else
     echo "Ports $ports are opened on the server and land on $target here."
     echo "Make sure the server side tunnel (same transport, port and token) is running."
@@ -586,7 +809,7 @@ create_frp_tunnel() { # called by create_stream for kcp / quic
 
 create_stream() {
   ensure_base || return 1
-  local pick role name transport port host="" token ports="" target="" links=8
+  local pick role name transport port host="" token ports="" target="" links=8 ipport="" frag=0 fport="" udp=0
   choose pick "Which side is this server?" \
     "server - listens for the tunnel (usually the Iran side)" \
     "client - dials in to the server (usually the foreign side)"
@@ -600,9 +823,10 @@ create_stream() {
     "wsmux   - multiplexed WebSocket" \
     "wssmux  - multiplexed WebSocket + TLS" \
     "kcp     - KCP over UDP (low latency, handles loss)" \
-    "quic    - QUIC over UDP (needs a clean, low-loss path)"
+    "quic    - QUIC over UDP (needs a clean, low-loss path)" \
+    "quantum - KCP inside fake-TCP packets (no UDP on the wire)"
   transport="${pick%% *}"
-  if [[ "$transport" == kcp || "$transport" == quic ]]; then
+  if [[ "$transport" == kcp || "$transport" == quic || "$transport" == quantum ]]; then
     create_frp_tunnel
     return $?
   fi
@@ -611,13 +835,21 @@ create_stream() {
     ask_valid port "Tunnel port to listen on" "3080" valid_port
     ask_valid ports "Ports to open for users (e.g. 2052,8443=443,1000-2000)" "" valid_bh_ports
     ask_valid token "Token (Enter = auto-generate)" "$(gen_token)" valid_token
+    if [[ "$transport" == tcp ]] && ask_yes "Also carry UDP on these ports (accept_udp)"; then udp=1; fi
   else
     ask_valid host "IP or domain of the SERVER side" "" valid_host
     ask_valid port "Tunnel port of the server" "3080" valid_port
     ask_valid token "Token (must match the server)" "" valid_token
   fi
-  if ask_yes "Advanced options (parallel links)?"; then
+  if ask_yes "Advanced options (parallel links$([[ "$role" == client && "$transport" == wss* ]] && echo ', TLS fragment'))?"; then
     ask_valid links "Parallel links (more links = more resilient to throttling)" "$links" valid_links
+    if [[ "$role" == client && "$transport" == wss* ]]; then
+      if ask_yes "Send the TLS handshake in small pieces (helps against DPI that reads the first packet)"; then
+        install_fragproxy || return 1
+        frag=1
+        fport=$((41000 + RANDOM % 9000))
+      fi
+    fi
   fi
   build_backhaul || return 1
   sleep 2
@@ -862,7 +1094,7 @@ create_tun() {
   fi
   wgport=$((20000 + RANDOM % 20000)); lport=$((40000 + RANDOM % 20000))
   if [[ "$role" == server ]]; then
-    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443,53/udp; Enter = none)" "" valid_fwd_ports
+    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443,1000-2000,53/udp; Enter = none)" "" valid_fwd_ranges
     if [[ -n "$fwd" ]]; then
       ask_valid target "Deliver them to (address on the other side)" "${rcidr%/*}" valid_ipv4
     fi
@@ -1017,7 +1249,7 @@ create_kernel() {
     fi
   fi
   if [[ "$role" == server && "$mode" != sit ]]; then
-    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443,53/udp; Enter = none)" "" valid_fwd_ports
+    ask_valid fwd "Ports to forward through the tunnel (e.g. 2052,8443=443,1000-2000,53/udp; Enter = none)" "" valid_fwd_ranges
     if [[ -n "$fwd" ]]; then
       ask_valid target "Deliver them to (address on the other side)" "${rcidr%/*}" valid_ipv4
     fi
@@ -1072,7 +1304,7 @@ delete_tunnel() {
   fi
   [[ -f "$TDIR/$n.fw" ]] && bash "$TDIR/$n.fw" down >/dev/null 2>&1
   [[ -f "$TDIR/$n.sh" ]] && bash "$TDIR/$n.sh" down >/dev/null 2>&1
-  rm -f "$TDIR/$n".{meta,toml,fw,sh} "$CONF/certs/$n".{crt,key}
+  rm -f "$TDIR/$n".{meta,toml,fw,sh,run} "$CONF/certs/$n".{crt,key}
   ok "Tunnel '$n' removed."
 }
 
@@ -1108,7 +1340,11 @@ test_tunnel() {
   load_meta "$n"
   if [[ "$KIND" == stream || "$KIND" == frp ]]; then
     echo "Service: $(status_of "$n")"
-    if [[ "$ROLE" == server ]]; then ss -lntu 2>/dev/null | grep -E ":$PORT\b" || warn "Nothing is listening on $PORT."; fi
+    if [[ "$ROLE" == server && "$MODE" == quantum ]]; then
+      ss -lnu 2>/dev/null | grep -E ":${IPORT:-0}\b" || warn "The inner KCP listener is not up yet."
+    elif [[ "$ROLE" == server ]]; then
+      ss -lntu 2>/dev/null | grep -E ":$PORT\b" || warn "Nothing is listening on $PORT."
+    fi
     journalctl -u "$APP-$n.service" -n 8 --no-pager 2>/dev/null
   else
     health_check "$PEER"
@@ -1133,6 +1369,8 @@ show_info() {
   [[ -n "${TTL:-}" ]] && echo "TTL     : $TTL"
   [[ -n "${PORTS:-}" ]] && echo "Ports   : $PORTS"
   [[ -n "${LINKS:-}" ]] && echo "Links   : $LINKS"
+  [[ "${FRAG:-0}" == 1 ]] && echo "TLS frag: on (local proxy port $FPORT)"
+  [[ "${UDP:-0}" == 1 ]] && echo "UDP     : carried over this tcp tunnel (accept_udp)"
   [[ "$KIND" == frp && -n "${TARGET:-}" ]] && echo "Lands on: $TARGET (this server)"
   [[ -n "${FWD:-}" ]] && echo "Forward : $FWD -> ${TARGET:-$PEER}"
   [[ -n "${TOKEN:-}" ]] && echo "Token   : $TOKEN"
@@ -1152,7 +1390,7 @@ edit_ports() { # edit_ports name
       cur="${PORTS:-}"
       ask_valid newp "Ports to open on the server" "$cur" valid_fwd_nonempty
       {
-        local name="$n" role="$ROLE" transport="$MODE" port="$PORT" host="${HOST:-}" token="$TOKEN" ports="$newp" target="${TARGET:-127.0.0.1}"
+        local name="$n" role="$ROLE" transport="$MODE" port="$PORT" host="${HOST:-}" token="$TOKEN" ports="$newp" target="${TARGET:-127.0.0.1}" ipport="${IPORT:-}"
         gen_frp_conf
       }
       meta_set "$n" PORTS "$newp"
@@ -1162,7 +1400,7 @@ edit_ports() { # edit_ports name
       cur="${PORTS:-}"
       ask_valid newp "Ports to open for users" "$cur" valid_bh_ports
       {
-        local name="$n" role="$ROLE" transport="$MODE" port="$PORT" host="${HOST:-}" token="$TOKEN" ports="$newp" links="${LINKS:-8}"
+        local name="$n" role="$ROLE" transport="$MODE" port="$PORT" host="${HOST:-}" token="$TOKEN" ports="$newp" links="${LINKS:-8}" udp="${UDP:-0}" frag="${FRAG:-0}" fport="${FPORT:-}"
         gen_backhaul_conf
       }
       meta_set "$n" PORTS "$newp"
@@ -1171,7 +1409,7 @@ edit_ports() { # edit_ports name
     tun | kernel)
       if [[ "$MODE" == sit ]]; then warn "Port forwarding is not available for sit tunnels."; return 1; fi
       cur="${FWD:-}"
-      ask_valid newp "Forwarded ports ('-' clears all)" "$cur" valid_fwd_or_clear
+      ask_valid newp "Forwarded ports ('-' clears all)" "$cur" valid_fwd_ranges_or_clear
       [[ "$newp" == "-" ]] && newp=""
       target="${TARGET:-$PEER}"
       if [[ -n "$newp" ]]; then ask_valid target "Deliver them to (address on the other side)" "$target" valid_ipv4; fi
@@ -1326,6 +1564,7 @@ uninstall_all() {
   [[ "$yn" == yes ]] || { warn "Cancelled."; return; }
   list_tunnels
   for n in "${TUNNELS[@]}"; do delete_tunnel "$n"; done
+  if [[ -f "$TUNE_FILE" || -f "$CONF/sysctl-backup.conf" ]]; then tune_reset; fi
   rm -rf "$BASE" "$CONF" "/usr/local/bin/$APP"
   ok "Toolstunnel removed. (WireGuard tools, if installed, were left in place.)"
   exit 0
@@ -1386,7 +1625,7 @@ main_menu() {
   local pick
   while true; do
     banner
-    mi "$C_G" 1 "Create stream tunnel" "tcpmux, ws, wss, kcp, quic ..."
+    mi "$C_G" 1 "Create stream tunnel" "tcpmux, ws, wss, kcp, quic, quantum ..."
     mi "$C_G" 2 "Create TUN tunnel" "tun-tcp, tun-udp, tun-icmp, tun-ip"
     mi "$C_G" 3 "Create kernel tunnel" "GRE, GRETAP, IPIP, SIT, L2TP"
     mi "$C_Y" 4 "Manage tunnels"

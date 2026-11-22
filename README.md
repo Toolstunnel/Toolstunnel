@@ -22,6 +22,7 @@ Run it as **root** on **both** servers. Next time just run `toolstunnel`.
 | --- | --- | --- |
 | Stream tunnel | `tcpmux` `tcp` `ws` `wss` `wsmux` `wssmux` | [Backhaul](https://github.com/Musixal/Backhaul) |
 | Stream tunnel | `kcp` · `quic` (UDP) | [frp](https://github.com/fatedier/frp) |
+| Stream tunnel | `quantum` (KCP inside fake-TCP, no UDP on the wire) | frp + [udp2raw](https://github.com/wangyu-/udp2raw) |
 | TUN tunnel | `tun-tcp` (fake-TCP) · `tun-udp` · `tun-icmp` | WireGuard + [udp2raw](https://github.com/wangyu-/udp2raw) |
 | TUN tunnel | `tun-ip` (GRE or IPIP carrier) | WireGuard inside a kernel IP tunnel |
 | Kernel tunnel | `gre` · `gretap` · `ipip` · `sit` · `l2tp` | Linux kernel (`ip link`, `ip l2tp`) |
@@ -77,10 +78,12 @@ Type a comma-separated list:
 | `2052/both` | TCP and UDP |
 | `8443=443` | Listen on 8443, deliver to 443 |
 | `8443=443/udp` | Same, UDP |
+| `1000-2000` | TUN / kernel only: a whole range to the same ports |
+| `1000-2000=443` | TUN / kernel only: a whole range delivered to one port |
 
-For stream tunnels (Backhaul) use its own syntax, for example `2052,8443=443,1000-2000`.
+For stream tunnels (Backhaul) use its own syntax, for example `2052,8443=443,1000-2000`, `443-600:5201` (a range delivered to one port) or `443=1.1.1.1:5201` (a target IP). On a `tcp` tunnel the server can also ask to carry UDP on the same ports (`accept_udp`).
 
-**`kcp` and `quic` work differently:** the ports are asked on the **client** side (the foreign server). They are opened on the server and land on the client machine (`127.0.0.1` by default, or the address you type). Use the same list syntax as above, including `/udp` and `/both`. Edit them later on the client with **Edit ports**.
+**`kcp`, `quic` and `quantum` work differently:** the ports are asked on the **client** side (the foreign server). They are opened on the server and land on the client machine (`127.0.0.1` by default, or the address you type). Use the same list syntax as above, including `/udp` and `/both`. Edit them later on the client with **Edit ports**.
 
 Change the list later with **Manage tunnels → your tunnel → Edit ports** (no need to recreate the tunnel).
 
@@ -99,6 +102,8 @@ The main menu shows a banner, your server IP, location and datacenter, which cor
 - `tun-ip` needs both servers to have a real public IP (no NAT) and your provider to allow GRE (47) or IPIP (4). It also works on ARM64.
 - The **speed limit** caps what this server sends into the tunnel; set it on both sides for a two-way cap.
 - GRE, GRETAP, IPIP, SIT and L2TP need your provider to allow those protocols between the two servers.
+- `quantum` runs frp's KCP on loopback only and carries it between the servers inside fake-TCP packets (udp2raw), encrypted with a key derived from the token. Nothing UDP crosses the network. It needs an **x86_64** server, the chosen **TCP** port open in the firewall, and no real service listening on that port (443 is a good choice if it is free).
+- **TLS fragment** (Advanced options on a `wss`/`wssmux` **client**): a small local Python proxy sends the first TLS packet in pieces of 20-80 bytes with a few ms between them, which helps against DPI that only reads the first packet. It does not add encryption or authentication. If you connect by IP address there is no SNI to hide, so the benefit is against pattern matching only. Needs `python3` (installed automatically if missing).
 - `kcp` and `quic` need UDP to pass between the two servers. `quic` collapses on lossy paths; use `kcp` or `tcpmux` there.
 - **Parallel links** (Advanced options on Backhaul tunnels) opens several TCP links at once, which helps when a network throttles each connection. It is the closest thing to a bonded-TCP mode here.
 - The script does not forge source IP addresses.
@@ -114,7 +119,7 @@ The main menu shows a banner, your server IP, location and datacenter, which cor
 
 ## Not included
 
-`sctp`, kernel Multipath TCP (`mptcp`), `anytls`, `http`/`https` mimicry, source-IP spoofing and other names found in closed-source tools. They need a custom tunnel core or kernel support that third-party programs do not provide.
+`sctp`, kernel Multipath TCP (`mptcp`), `anytls`, `probe_decoy` (it needs a custom tunnel core), `http`/`https` mimicry, source-IP spoofing and other names found in closed-source tools. They need a custom tunnel core or kernel support that third-party programs do not provide.
 
 ## License
 
@@ -140,6 +145,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 | --- | --- | --- |
 | تونل جریانی (Stream) | `tcpmux` `tcp` `ws` `wss` `wsmux` `wssmux` | Backhaul |
 | تونل جریانی (Stream) | `kcp` · `quic` (روی UDP) | frp |
+| تونل جریانی (Stream) | `quantum` (‏KCP داخل TCP جعلی، بدون UDP روی سیم) | frp + udp2raw |
 | تونل TUN | `tun-tcp` (فیک‌تی‌سی‌پی) · `tun-udp` · `tun-icmp` | WireGuard + udp2raw |
 | تونل TUN | `tun-ip` (حامل GRE یا IPIP) | WireGuard داخل تونل IP کرنل |
 | تونل کرنلی | `gre` · `gretap` · `ipip` · `sit` · `l2tp` | خود کرنل لینوکس |
@@ -192,10 +198,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 | `2052/both` | هر دو TCP و UDP |
 | `8443=443` | روی 8443 گوش بده، به 443 برسان |
 | `8443=443/udp` | همان، برای UDP |
+| `1000-2000` | فقط TUN و کرنلی: کل بازه به همان پورت‌ها |
+| `1000-2000=443` | فقط TUN و کرنلی: کل بازه به یک پورت |
 
-برای تونل Stream از قالب خود Backhaul استفاده کن، مثلاً `2052,8443=443,1000-2000`.
+برای تونل Stream از قالب خود Backhaul استفاده کن، مثلاً `2052,8443=443,1000-2000` یا `443-600:5201` (بازه به یک پورت) یا `443=1.1.1.1:5201` (آی‌پی مقصد). روی تونل `tcp` سرور می‌تواند بپرسد UDP هم روی همان پورت‌ها رد شود (`accept_udp`).
 
-**در `kcp` و `quic` فرق دارد:** پورت‌ها سمت **client** (سرور خارج) پرسیده می‌شود. روی server باز می‌شوند و به سرور client می‌رسند (پیش‌فرض `127.0.0.1` یا آدرسی که بنویسی). قالب لیست همان است و `/udp` و `/both` هم کار می‌کند. بعداً با **Edit ports** روی client عوضش کن.
+**در `kcp` و `quic` و `quantum` فرق دارد:** پورت‌ها سمت **client** (سرور خارج) پرسیده می‌شود. روی server باز می‌شوند و به سرور client می‌رسند (پیش‌فرض `127.0.0.1` یا آدرسی که بنویسی). قالب لیست همان است و `/udp` و `/both` هم کار می‌کند. بعداً با **Edit ports** روی client عوضش کن.
 
 لیست را بعداً بدون ساخت دوبارهٔ تونل می‌شود عوض کرد: **Manage tunnels ← تونل ← Edit ports**.
 
@@ -214,6 +222,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Toolstunnel/Toolstunnel/main
 - `tun-ip` به IP عمومی واقعی روی هر دو سرور (بدون NAT) و اجازهٔ GRE (۴۷) یا IPIP (۴) از طرف دیتاسنتر نیاز دارد. روی ARM64 هم کار می‌کند.
 - **محدودیت سرعت** فقط چیزی را که این سرور وارد تونل می‌کند محدود می‌کند؛ برای محدودیت دوطرفه روی هر دو سمت بگذار.
 - برای GRE، GRETAP، IPIP، SIT و L2TP باید دیتاسنتر این پروتکل‌ها را بین دو سرور اجازه بدهد.
+- `quantum` فقط روی لوپ‌بک KCP (frp) اجرا می‌کند و بین دو سرور آن را داخل بسته‌های TCP جعلی (udp2raw) و رمزنگاری‌شده با کلید مشتق از توکن می‌فرستد؛ هیچ UDP روی شبکه رد نمی‌شود. به سرور **x86_64**، باز بودن پورت **TCP** انتخابی در فایروال، و نبودن سرویس واقعی روی همان پورت نیاز دارد (اگر آزاد است 443 انتخاب خوبی است).
+- **TLS fragment** (در Advanced options تونل `wss`/`wssmux` سمت **client**): یک پروکسی کوچک Python محلی اولین بستهٔ TLS را در تکه‌های ۲۰ تا ۸۰ بایتی با چند میلی‌ثانیه فاصله می‌فرستد و در برابر DPI که فقط بستهٔ اول را می‌خواند کمک می‌کند. رمزنگاری یا احراز هویت اضافه نمی‌کند. اگر با IP وصل شوی SNI‌ای برای پنهان‌کردن نیست و فقط در برابر الگوشناسی کمک می‌کند. به `python3` نیاز دارد (در صورت نبودن خودکار نصب می‌شود).
 - `kcp` و `quic` به عبور UDP بین دو سرور نیاز دارند. `quic` روی مسیر پر از loss ضعیف می‌شود؛ آنجا `kcp` یا `tcpmux` بزن.
 - **لینک موازی** (Advanced options در تونل‌های Backhaul) چند اتصال TCP هم‌زمان باز می‌کند و وقتی شبکه هر اتصال را جداگانه کند می‌کند کمک می‌کند. نزدیک‌ترین چیز به حالت bonded-TCP همین است.
 - اسکریپت IP مبدأ را جعل نمی‌کند.
